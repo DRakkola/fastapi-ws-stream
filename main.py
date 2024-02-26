@@ -4,6 +4,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from starlette.websockets import WebSocketState
+import requests
+import threading
+from datetime import datetime
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+import io
 
 app = FastAPI()
 
@@ -115,12 +122,58 @@ async def websocket_stream_endpoint(websocket: WebSocket, stream_id: str):
 async def stream_endpoint(websocket: WebSocket, stream_id: str):
     await websocket.accept()
     print(f"Stream {stream_id} accepted connection.")
+    mission_id = None
+
+    def end_mission():
+        response = requests.post("http://127.0.0.1:8000/endstream/")
+        print(f"Image posted with response: {response.status_code}")
+
+    def post_mission():
+        nonlocal mission_id  # Use nonlocal to modify the mission_id outside of the nested function
+        # Create a new mission
+        mission_data = {
+            "id": str(uuid.uuid4()),
+            "name": datetime.now().isoformat(),
+            "drone": "anka",
+            "started": datetime.now().isoformat(),
+            "published": True,
+            "live": True,
+        }
+
+        headers = {"content-type": "application/json"}
+        response = requests.post(
+            "http://127.0.0.1:8000/api/new-mission/", json=mission_data, headers=headers
+        )
+        if response.status_code == 201:
+            mission_id = response.json().get("id")
+            print(f"New mission created with ID: {mission_id}")
+        else:
+            print(f"Failed to create new mission. Status code: {response.status_code}")
+
     await manager.broadcast("streamingStarted", "success")
+    image_counter = 0  # Initialize a counter for received images
+    # Launch post_mission in a new thread
+
+    def post_image(image_data):
+        # Convert byte data to an image
+        image = Image.open(io.BytesIO(image_data))
+
+        # Save the image to a temporary buffer
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        buf.seek(0)  # Move to the start of the buffer
+
+        files = {"picture": buf}
+        response = requests.post("http://127.0.0.1:8000/upload/files/", files=files)
+        print(f"Image posted with response: {response.status_code}")
+
     try:
+        threading.Thread(target=post_mission).start()
         while True:
             websocket_data = await websocket.receive()
             if "bytes" in websocket_data:
                 frame_data = websocket_data["bytes"]
+                image_counter += 1
                 if stream_id in websocket_connections:
                     send_coroutines = [
                         ws.send_bytes(frame_data)
@@ -128,22 +181,25 @@ async def stream_endpoint(websocket: WebSocket, stream_id: str):
                     ]
                     await asyncio.gather(*send_coroutines)
                     print(f"Streaming data for stream {stream_id}.")
+
+                if image_counter % 5 == 0:  # Check if it's the fifth image
+                    threading.Thread(target=post_image, args=(frame_data,)).start()
+
             else:
+                if websocket_data["text"] == "websocket.disconnect":
+                    await manager.broadcast("Streaming ended.", "end")
+                    threading.Thread(target=end_mission).start()
+                elif websocket_data["text"] == "StreamEnded":
+                    print(f"Streaming ended,{websocket_data}")
+                    await manager.broadcast("Streaming ended.", "end")
+                    threading.Thread(target=end_mission).start()
+                else:
+                    print(f"Expected bytes, received: {websocket_data}")
 
-                match websocket_data['text']:
-
-                    case 'websocket.disconnect':
-                        await manager.broadcast("Streaming ended.", "end")
-                    case 'StreamEnded':
-                        print(f"Streaming ended,{websocket_data}")
-                        await manager.broadcast("Streaming ended.", "end")
-                    case _:
-                        print(f"Expected bytes, received: {websocket_data}")
-
-                
     except WebSocketDisconnect:
         await manager.broadcast("Streaming ended.", "end")
         print(f"Stream {stream_id} disconnected with exception.")
+        threading.Thread(target=end_mission).start()
     finally:
         if (
             stream_id in websocket_connections
@@ -158,5 +214,4 @@ async def stream_endpoint(websocket: WebSocket, stream_id: str):
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting server...")
-    uvicorn.run(app, host="0.0.0.0", port=80)
+    uvicorn.run("main:app", host="0.0.0.0", port=80, reload=True)
